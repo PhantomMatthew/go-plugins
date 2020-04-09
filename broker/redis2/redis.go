@@ -53,7 +53,7 @@ func (p *publication) Error() error {
 // subscriber proxies and handles Redis messages as broker publications.
 type subscriber struct {
 	codec  codec.Marshaler
-	client   *redis.Client
+	client *redis.Client
 	topic  string
 	handle broker.Handler
 	opts   broker.SubscribeOptions
@@ -73,7 +73,6 @@ func (s *subscriber) recv(channel string) {
 
 	ch := s.client.Subscribe(channel).Channel()
 
-
 	// Handle error? Only a log would be necessary since this type
 	// of issue cannot be fixed.
 
@@ -81,7 +80,6 @@ func (s *subscriber) recv(channel string) {
 		var m broker.Message
 
 		msg, _ := <-ch
-		fmt.Println("received msg from channel")
 		if err := s.codec.Unmarshal([]byte(msg.Payload), &m); err != nil {
 			log.Fatal("received message error")
 		}
@@ -90,7 +88,6 @@ func (s *subscriber) recv(channel string) {
 			topic:   msg.Channel,
 			message: &m,
 		}
-		fmt.Println(msg.Channel)
 		fmt.Println(m)
 
 		// Handle error? Retry?
@@ -104,9 +101,7 @@ func (s *subscriber) recv(channel string) {
 				log.Fatal("ack message error")
 			}
 		}
-
 	}
-
 
 		//switch x := rcv.(type) {
 		//case redis.Message:
@@ -163,7 +158,7 @@ func (s *subscriber) Topic() string {
 // Unsubscribe unsubscribes the subscriber and frees the connection.
 func (s *subscriber) Unsubscribe() error {
 	// TODO to refractor this later
-	s.client.Do("unsubscribe")
+	s.client.Do("unsubscribe", s.Topic())
 	//s.client.Conn().Close()
 	return nil
 }
@@ -300,7 +295,7 @@ func (b *redisBroker) Subscribe(topic string, handler broker.Handler, opts ...br
 	}
 
 	// Run the receiver routine.
-	go s.recv(s.topic)
+	go s.recv(topic)
 
 	if pubsub := s.client.Subscribe(s.topic); pubsub == nil {
 		// TODO add error for this later

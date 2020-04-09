@@ -77,9 +77,9 @@ func TestBroker(t *testing.T) {
 
 		unsubscribe(t, s2)
 
-		publish(t, b, "test", &broker.Message{
-			Body: []byte("none"),
-		})
+		//publish(t, b, "test", &broker.Message{
+		//	Body: []byte("none"),
+		//})
 
 		close(msgs)
 	}()
@@ -94,6 +94,7 @@ func TestBroker(t *testing.T) {
 		"s2:hello",
 		"s1:world",
 		"s2:world",
+		"s1:other",
 		"s2:other",
 	}
 
