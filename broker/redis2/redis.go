@@ -1,18 +1,23 @@
 // Package redis provides a Redis broker
-package redis
+package redis2
 
+import "C"
 import (
 	"context"
 	"errors"
-	"strings"
-	"time"
+	"fmt"
+	"log"
 
-	"github.com/gomodule/redigo/redis"
+	//old "github.com/gomodule/redigo/redis"
+	redis "github.com/go-redis/redis/v7"
 	"github.com/micro/go-micro/v2/broker"
 	"github.com/micro/go-micro/v2/codec"
 	"github.com/micro/go-micro/v2/codec/json"
 	"github.com/micro/go-micro/v2/config/cmd"
 )
+
+//var ErrNil = errors.New("go-redis: nil returned")
+//type Error string
 
 func init() {
 	cmd.DefaultBrokers["redis"] = NewBroker
@@ -48,7 +53,7 @@ func (p *publication) Error() error {
 // subscriber proxies and handles Redis messages as broker publications.
 type subscriber struct {
 	codec  codec.Marshaler
-	conn   *redis.PubSubConn
+	client   *redis.Client
 	topic  string
 	handle broker.Handler
 	opts   broker.SubscribeOptions
@@ -56,47 +61,93 @@ type subscriber struct {
 
 // recv loops to receive new messages from Redis and handle them
 // as publications.
-func (s *subscriber) recv() {
+func (s *subscriber) recv(channel string) {
+
 	// Close the connection once the subscriber stops receiving.
-	defer s.conn.Close()
+	defer s.client.Conn().Close()
+
+	_, err := s.client.Subscribe(channel).Receive()
+	if err != nil {
+		return
+	}
+
+	ch := s.client.Subscribe(channel).Channel()
+
+
+	// Handle error? Only a log would be necessary since this type
+	// of issue cannot be fixed.
 
 	for {
-		switch x := s.conn.Receive().(type) {
-		case redis.Message:
-			var m broker.Message
+		var m broker.Message
 
-			// Handle error? Only a log would be necessary since this type
-			// of issue cannot be fixed.
-			if err := s.codec.Unmarshal(x.Data, &m); err != nil {
-				break
-			}
-
-			p := publication{
-				topic:   x.Channel,
-				message: &m,
-			}
-
-			// Handle error? Retry?
-			if p.err = s.handle(&p); p.err != nil {
-				break
-			}
-
-			// Added for posterity, however Ack is a no-op.
-			if s.opts.AutoAck {
-				if err := p.Ack(); err != nil {
-					break
-				}
-			}
-
-		case redis.Subscription:
-			if x.Count == 0 {
-				return
-			}
-
-		case error:
-			return
+		msg, _ := <-ch
+		fmt.Println("received msg from channel")
+		if err := s.codec.Unmarshal([]byte(msg.Payload), &m); err != nil {
+			log.Fatal("received message error")
 		}
+
+		p := publication{
+			topic:   msg.Channel,
+			message: &m,
+		}
+		fmt.Println(msg.Channel)
+		fmt.Println(m)
+
+		// Handle error? Retry?
+		if p.err = s.handle(&p); p.err != nil {
+			log.Fatal("handle message error")
+		}
+
+		// Added for posterity, however Ack is a no-op.
+		if s.opts.AutoAck {
+			if err := p.Ack(); err != nil {
+				log.Fatal("ack message error")
+			}
+		}
+
 	}
+
+
+		//switch x := rcv.(type) {
+		//case redis.Message:
+		//	fmt.Println("message type")
+		//	var m broker.Message
+		//
+		//	// Handle error? Only a log would be necessary since this type
+		//	// of issue cannot be fixed.
+		//	if err := s.codec.Unmarshal([]byte(x.String()), &m); err != nil {
+		//		break
+		//	}
+		//
+		//	p := publication{
+		//		topic:   x.Channel,
+		//		message: &m,
+		//	}
+		//	fmt.Println(x.Channel)
+		//	fmt.Println(m)
+		//
+		//	// Handle error? Retry?
+		//	if p.err = s.handle(&p); p.err != nil {
+		//		break
+		//	}
+		//
+		//	// Added for posterity, however Ack is a no-op.
+		//	if s.opts.AutoAck {
+		//		if err := p.Ack(); err != nil {
+		//			break
+		//		}
+		//	}
+		//
+		//case redis.Subscription:
+		//	fmt.Println("subscription type")
+		//	if x.Count == 0 {
+		//		return
+		//	}
+		//
+		//case error:
+		//	return
+		//}
+	//}
 }
 
 // Options returns the subscriber options.
@@ -111,13 +162,16 @@ func (s *subscriber) Topic() string {
 
 // Unsubscribe unsubscribes the subscriber and frees the connection.
 func (s *subscriber) Unsubscribe() error {
-	return s.conn.Unsubscribe()
+	// TODO to refractor this later
+	s.client.Do("unsubscribe")
+	//s.client.Conn().Close()
+	return nil
 }
 
 // broker implementation for Redis.
 type redisBroker struct {
 	addr  string
-	pool  *redis.Pool
+	client  *redis.Client
 	opts  broker.Options
 	bopts *brokerOptions
 }
@@ -140,7 +194,7 @@ func (b *redisBroker) Address() string {
 
 // Init sets or overrides broker options.
 func (b *redisBroker) Init(opts ...broker.Option) error {
-	if b.pool != nil {
+	if b.client != nil {
 		return errors.New("redis: cannot init while connected")
 	}
 
@@ -154,49 +208,59 @@ func (b *redisBroker) Init(opts ...broker.Option) error {
 // Connect establishes a connection to Redis which provides the
 // pub/sub implementation.
 func (b *redisBroker) Connect() error {
-	if b.pool != nil {
+	if b.client != nil {
 		return nil
 	}
 
 	var addr string
 
 	if len(b.opts.Addrs) == 0 || b.opts.Addrs[0] == "" {
-		addr = "redis://127.0.0.1:6379"
+		addr = "127.0.0.1:6379"
 	} else {
 		addr = b.opts.Addrs[0]
 
-		if !strings.HasPrefix("redis://", addr) {
-			addr = "redis://" + addr
-		}
+		//if !strings.HasPrefix("redis://", addr) {
+		//	addr = "redis://" + addr
+		//}
 	}
 
 	b.addr = addr
 
-	b.pool = &redis.Pool{
-		MaxIdle:     b.bopts.maxIdle,
-		MaxActive:   b.bopts.maxActive,
-		IdleTimeout: b.bopts.idleTimeout,
-		Dial: func() (redis.Conn, error) {
-			return redis.DialURL(
-				b.addr,
-				redis.DialConnectTimeout(b.bopts.connectTimeout),
-				redis.DialReadTimeout(b.bopts.readTimeout),
-				redis.DialWriteTimeout(b.bopts.writeTimeout),
-			)
-		},
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			_, err := c.Do("PING")
-			return err
-		},
-	}
+	//b.pool = &redis.Pool{
+	//	MaxIdle:     b.bopts.maxIdle,
+	//	MaxActive:   b.bopts.maxActive,
+	//	IdleTimeout: b.bopts.idleTimeout,
+	//	Dial: func() (redis.Conn, error) {
+	//		return redis.DialURL(
+	//			b.addr,
+	//			redis.DialConnectTimeout(b.bopts.connectTimeout),
+	//			redis.DialReadTimeout(b.bopts.readTimeout),
+	//			redis.DialWriteTimeout(b.bopts.writeTimeout),
+	//		)
+	//	},
+	//	TestOnBorrow: func(c redis.Conn, t time.Time) error {
+	//		_, err := c.Do("PING")
+	//		return err
+	//	},
+	//}
+	b.client = redis.NewClient(
+		&redis.Options{
+			Network: "",
+			Addr:				b.addr,
+			Dialer:             nil,
+			OnConnect:          nil,
+			Password:           "",
+			DB:                 0,
+			PoolSize:			10,
 
+		})
 	return nil
 }
 
 // Disconnect closes the connection pool.
 func (b *redisBroker) Disconnect() error {
-	err := b.pool.Close()
-	b.pool = nil
+	err := b.client.Conn().Close()
+	b.client = nil
 	b.addr = ""
 	return err
 }
@@ -207,9 +271,15 @@ func (b *redisBroker) Publish(topic string, msg *broker.Message, opts ...broker.
 	if err != nil {
 		return err
 	}
-	conn := b.pool.Get()
-	_, err = redis.Int(conn.Do("PUBLISH", topic, v))
-	conn.Close()
+
+	//cmd := b.client.Do("PUBLISH", topic, v)
+	//_, err = redis.Int(b.client.Do("PUBLISH", topic, v))
+	//fmt.Println(b.Address())
+	cmd := b.client.Publish(topic, v)
+	if cmd == nil {
+		fmt.Println("cmd is nil")
+	}
+	b.client.Conn().Close()
 
 	return err
 }
@@ -223,17 +293,18 @@ func (b *redisBroker) Subscribe(topic string, handler broker.Handler, opts ...br
 
 	s := subscriber{
 		codec:  b.opts.Codec,
-		conn:   &redis.PubSubConn{Conn: b.pool.Get()},
+		client:  b.client,
 		topic:  topic,
 		handle: handler,
 		opts:   options,
 	}
 
 	// Run the receiver routine.
-	go s.recv()
+	go s.recv(s.topic)
 
-	if err := s.conn.Subscribe(s.topic); err != nil {
-		return nil, err
+	if pubsub := s.client.Subscribe(s.topic); pubsub == nil {
+		// TODO add error for this later
+		return nil, nil
 	}
 
 	return &s, nil
@@ -268,3 +339,26 @@ func NewBroker(opts ...broker.Option) broker.Broker {
 		bopts: bopts,
 	}
 }
+
+
+//func Int(reply interface{}, err error) (int, error) {
+//	if err != nil {
+//		return 0, err
+//	}
+//	switch reply := reply.(type) {
+//	case int64:
+//		x := int(reply)
+//		if int64(x) != reply {
+//			return 0, strconv.ErrRange
+//		}
+//		return x, nil
+//	case []byte:
+//		n, err := strconv.ParseInt(string(reply), 10, 0)
+//		return int(n), err
+//	case nil:
+//		return 0, ErrNil
+//	case Error:
+//		return 0, reply
+//	}
+//	return 0, fmt.Errorf("redigo: unexpected type for Int, got type %T", reply)
+//}
