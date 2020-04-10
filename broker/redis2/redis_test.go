@@ -3,6 +3,7 @@ package redis2
 import (
 	"fmt"
 	"github.com/micro/go-micro/v2/broker"
+	"log"
 	"os"
 	"reflect"
 	"sort"
@@ -50,12 +51,14 @@ func TestBroker(t *testing.T) {
 
 	go func() {
 		s1 := subscribe(t, b, "test", func(p broker.Event) error {
+			log.Println("subscribe test for s1")
 			m := p.Message()
 			msgs <- fmt.Sprintf("s1:%s", string(m.Body))
 			return nil
 		})
 
 		s2 := subscribe(t, b, "test", func(p broker.Event) error {
+			log.Println("subscribe test for s2")
 			m := p.Message()
 			msgs <- fmt.Sprintf("s2:%s", string(m.Body))
 			return nil
@@ -77,9 +80,9 @@ func TestBroker(t *testing.T) {
 
 		unsubscribe(t, s2)
 
-		//publish(t, b, "test", &broker.Message{
-		//	Body: []byte("none"),
-		//})
+		publish(t, b, "test", &broker.Message{
+			Body: []byte("none"),
+		})
 
 		close(msgs)
 	}()
@@ -94,7 +97,6 @@ func TestBroker(t *testing.T) {
 		"s2:hello",
 		"s1:world",
 		"s2:world",
-		"s1:other",
 		"s2:other",
 	}
 

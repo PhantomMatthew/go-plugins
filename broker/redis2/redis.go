@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
+	"time"
 
-	//old "github.com/gomodule/redigo/redis"
-	redis "github.com/go-redis/redis/v7"
+	"github.com/go-redis/redis/v7"
 	"github.com/micro/go-micro/v2/broker"
 	"github.com/micro/go-micro/v2/codec"
 	"github.com/micro/go-micro/v2/codec/json"
@@ -25,6 +27,8 @@ func init() {
 
 // publication is an internal publication for the Redis broker.
 type publication struct {
+	consumerGroup string
+	stream string
 	topic   string
 	message *broker.Message
 	err     error
@@ -54,52 +58,136 @@ func (p *publication) Error() error {
 type subscriber struct {
 	codec  codec.Marshaler
 	client *redis.Client
+	consumerGroup string
+	stream string
 	topic  string
 	handle broker.Handler
 	opts   broker.SubscribeOptions
 }
 
+func (s *subscriber) deleteLastMessages(receiverStreamName string, groupName string, id string) {
+	// 查看这个stream的消费组状态
+	xinfoCmd := s.client.Pipeline().XInfoGroups(receiverStreamName)
+	xinfoGroups, err := xinfoCmd.Result()
+
+	if err == nil && len(xinfoGroups) > 0 {
+		// 获得排除当前组后的group组
+		var otherGroups []redis.XInfoGroups
+		for _, item := range xinfoGroups {
+			if item.Name != groupName {
+				otherGroups = append(otherGroups, item)
+			}
+		}
+		if len(otherGroups) > 0 {
+			// 判断当前消费组接收ID小于其他分组的lastid就删除
+			minId, _ := strconv.Atoi(strings.Split(otherGroups[0].LastDeliveredID, "-")[0])
+			for i := 1; i < len(otherGroups); i++ {
+				newValue, _ := strconv.Atoi(strings.Split(otherGroups[i].LastDeliveredID, "-")[0])
+				if minId > newValue {
+					minId = newValue
+				}
+			}
+			currentId, _ := strconv.Atoi(strings.Split(id, "-")[0])
+			if currentId < minId {
+				//当前组为最后消费的组
+				delResult := s.client.Pipeline().XDel(receiverStreamName, id)
+				fmt.Println(delResult)
+			}
+		}
+
+	}
+}
+
 // recv loops to receive new messages from Redis and handle them
 // as publications.
-func (s *subscriber) recv(channel string) {
+func (s *subscriber) recv(stream string, consumerGroup string, consumer string) {
 
 	// Close the connection once the subscriber stops receiving.
-	defer s.client.Conn().Close()
+	//defer s.client.Conn().Close()
+	defer s.client.Pipeline().Close()
 
-	_, err := s.client.Subscribe(channel).Receive()
-	if err != nil {
-		return
-	}
 
-	ch := s.client.Subscribe(channel).Channel()
+	check_backlog := true
+	var lastId = "0-0"
+
+	//_, err := s.client.Subscribe(stream).Receive()
+	//if err != nil {
+	//	return
+	//}
+	//
 
 	// Handle error? Only a log would be necessary since this type
 	// of issue cannot be fixed.
 
 	for {
-		var m broker.Message
-
-		msg, _ := <-ch
-		if err := s.codec.Unmarshal([]byte(msg.Payload), &m); err != nil {
-			log.Fatal("received message error")
+		log.Println("in first for loop of recv")
+		var myId string
+		if check_backlog {
+			myId = lastId
+		} else {
+			myId = ">"
 		}
 
-		p := publication{
-			topic:   msg.Channel,
-			message: &m,
-		}
-		fmt.Println(m)
-
-		// Handle error? Retry?
-		if p.err = s.handle(&p); p.err != nil {
-			log.Fatal("handle message error")
+		args := redis.XReadGroupArgs{
+			Group:    "ggg",
+			Consumer: "customer",
+			Streams:  []string{stream, myId},
+			Count:    10,
+			Block:    time.Duration(5) * time.Second,
 		}
 
-		// Added for posterity, however Ack is a no-op.
-		if s.opts.AutoAck {
-			if err := p.Ack(); err != nil {
-				log.Fatal("ack message error")
+		result := s.client.XReadGroup(&args)
+
+		ss := result.Val()
+		if ss == nil {
+			fmt.Println("no message")
+			time.Sleep(time.Second * 2)
+			continue
+		}
+
+		// TODO to update the processing later
+		// 说明已经处理完了之前 未确认 的消息，开始处理新消息，lastId改为 >
+		if len(ss[0].Messages) == 0 {
+			fmt.Println("read end")
+			check_backlog = false
+		}
+
+		for _, item := range ss {
+			messages := item.Messages
+
+			log.Println("in second for loop for messages iterations")
+
+			for _, msg := range messages {
+				id := msg.ID
+				values := msg.Values
+				fmt.Println("result:",id,values)
+
+				message := values[stream].(string)
+				fmt.Println("message is " + message)
+				p := publication{
+					topic:   s.stream,
+					message: &broker.Message{
+						Header: map[string]string{
+							s.stream: stream,
+						},
+						Body:   []byte(message),
+					},
+				}
+
+				// Handle error? Retry?
+				if p.err = s.handle(&p); p.err != nil {
+					log.Fatal("handle message error")
+				} else {
+					// 消息消费确认
+					s.client.Pipeline().XAck(stream, consumerGroup, id)
+					// 验证是否消费组的所有人都消费后的逻辑
+					s.deleteLastMessages(stream, consumerGroup, id)
+
+					lastId = id
+					//time.Sleep(time.Second * 0)
+				}
 			}
+
 		}
 	}
 
@@ -155,11 +243,15 @@ func (s *subscriber) Topic() string {
 	return s.topic
 }
 
+func (s *subscriber) Stream() string {
+	return s.stream
+}
+
 // Unsubscribe unsubscribes the subscriber and frees the connection.
 func (s *subscriber) Unsubscribe() error {
 	// TODO to refractor this later
-	s.client.Do("unsubscribe", s.Topic())
-	//s.client.Conn().Close()
+	//s.client.Do("unsubscribe", s.Topic())
+	s.client.Pipeline().Close()
 	return nil
 }
 
@@ -167,8 +259,13 @@ func (s *subscriber) Unsubscribe() error {
 type redisBroker struct {
 	addr  string
 	client  *redis.Client
+	consumerGroup string
 	opts  broker.Options
 	bopts *brokerOptions
+}
+
+func (b *redisBroker) ConsumerGroup() string {
+	return b.consumerGroup
 }
 
 // String returns the name of the broker implementation.
@@ -260,47 +357,115 @@ func (b *redisBroker) Disconnect() error {
 	return err
 }
 
-// Publish publishes a message.
-func (b *redisBroker) Publish(topic string, msg *broker.Message, opts ...broker.PublishOption) error {
-	v, err := b.opts.Codec.Marshal(msg)
-	if err != nil {
-		return err
+func (b *redisBroker) publish(stream, consumerGroup string, values map[string]interface{}) string {
+	exists := b.client.Exists(stream)
+	if exists.Val() > 0 {
+		id := b.client.XAdd(&redis.XAddArgs{
+			Stream:       "",
+			MaxLen:       0,
+			MaxLenApprox: 0,
+			ID:           "*",
+			Values:       nil,
+		}).Val()
+
+		b.client.XDel(stream, id)
 	}
 
-	//cmd := b.client.Do("PUBLISH", topic, v)
-	//_, err = redis.Int(b.client.Do("PUBLISH", topic, v))
-	//fmt.Println(b.Address())
-	cmd := b.client.Publish(topic, v)
-	if cmd == nil {
-		fmt.Println("cmd is nil")
-	}
-	b.client.Conn().Close()
+
+	result := b.client.XAdd(&redis.XAddArgs{
+		Stream:       stream,
+		MaxLen:       5 * 100000,
+		MaxLenApprox: 0,
+		ID:           "*",
+		Values:       values,
+
+	})
+
+	return result.Val()
+
+}
+
+// Publish publishes a message.
+func (b *redisBroker) Publish(topic string, msg *broker.Message, opts ...broker.PublishOption) error {
+	//v, err := b.opts.Codec.Marshal(msg)
+	//if err != nil {
+	//	return err
+	//}
+	//fmt.Println(v)
+	//fmt.Println(msg)
+	var values map[string]interface{}
+	values = make(map[string]interface{})
+	values[topic] = string(msg.Body[:])
+
+	b.publish(topic, b.ConsumerGroup(), values)
+
+
+	err := b.client.Pipeline().Close()
 
 	return err
 }
 
 // Subscribe returns a subscriber for the topic and handler.
 func (b *redisBroker) Subscribe(topic string, handler broker.Handler, opts ...broker.SubscribeOption) (broker.Subscriber, error) {
+	log.Println("redis subscribe")
 	var options broker.SubscribeOptions
 	for _, o := range opts {
 		o(&options)
 	}
+	//
+	//s := subscriber{
+	//	codec:  b.opts.Codec,
+	//	client:  b.client,
+	//	consumerGroup: "",
+	//	stream: topic,
+	//	topic:  topic,
+	//	handle: handler,
+	//	opts:   options,
+	//}
+
+	//var clients []redis.XInfoGroups
+	//clients, err := b.client.XInfoGroups(topic).Result()
+	//if err != nil {
+	//	errors.New("xinfo group execute error")
+	//}
+	//if len(clients) > 0 {
+	//	var slist []subscriber
+	//	for idx, c := range clients  {
+	//		slist[idx] = subscriber{
+	//			codec:         b.opts.Codec,
+	//			client:        b.client,
+	//			consumerGroup: c.Name,
+	//			stream:        topic,
+	//			topic:         topic,
+	//			handle:        handler,
+	//			opts:          options,
+	//		}
+	//
+	//		slist[idx].recv(topic, slist[idx].consumerGroup, "test")
+	//	}
+	//}
+	b.consumerGroup = "ggg"
 
 	s := subscriber{
-		codec:  b.opts.Codec,
-		client:  b.client,
-		topic:  topic,
-		handle: handler,
-		opts:   options,
+		codec:         b.opts.Codec,
+		client:        b.client,
+		consumerGroup: b.ConsumerGroup(),
+		stream:        topic,
+		topic:         topic,
+		handle:        handler,
+		opts:          options,
 	}
+	s.client.XGroupCreate(s.stream, b.consumerGroup, "$")
+
+	go s.recv(topic, s.consumerGroup, "test")
 
 	// Run the receiver routine.
-	go s.recv(topic)
+	//go s.recv(topic)
 
-	if pubsub := s.client.Subscribe(s.topic); pubsub == nil {
-		// TODO add error for this later
-		return nil, nil
-	}
+	//if pubsub := s.client.Subscribe(s.topic); pubsub == nil {
+	//	// TODO add error for this later
+	//	return nil, nil
+	//}
 
 	return &s, nil
 }
@@ -335,25 +500,3 @@ func NewBroker(opts ...broker.Option) broker.Broker {
 	}
 }
 
-
-//func Int(reply interface{}, err error) (int, error) {
-//	if err != nil {
-//		return 0, err
-//	}
-//	switch reply := reply.(type) {
-//	case int64:
-//		x := int(reply)
-//		if int64(x) != reply {
-//			return 0, strconv.ErrRange
-//		}
-//		return x, nil
-//	case []byte:
-//		n, err := strconv.ParseInt(string(reply), 10, 0)
-//		return int(n), err
-//	case nil:
-//		return 0, ErrNil
-//	case Error:
-//		return 0, reply
-//	}
-//	return 0, fmt.Errorf("redigo: unexpected type for Int, got type %T", reply)
-//}
